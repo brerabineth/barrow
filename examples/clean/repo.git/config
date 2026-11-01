@@ -1,0 +1,6 @@
+[core]
+	repositoryformatversion = 0
+	bare = true
+[remote "origin"]
+	url = https://github.com/example/project.git
+	fetch = +refs/heads/*:refs/remotes/origin/*

